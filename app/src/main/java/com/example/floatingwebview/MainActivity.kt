@@ -1,6 +1,6 @@
 package com.example.floatingwebview
 
-import VisitedPageAdapter
+import com.example.floatingwebview.VisitedPageAdapter
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
