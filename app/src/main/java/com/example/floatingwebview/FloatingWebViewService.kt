@@ -66,6 +66,9 @@ class FloatingWebViewService : Service() {
 
     private var lastVisitedUrl: String? = null
     private var currentSelectionPopup: PopupWindow? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingSelectionPopup: Runnable? = null
+    private val enableCustomSelectionPopup = true
 
     // Javascript bridge for selection
     private inner class SelectionBridge {
@@ -76,7 +79,7 @@ class FloatingWebViewService : Service() {
 
         @JavascriptInterface
         fun onSelection(selectionJson: String?) {
-            if (selectionJson.isNullOrBlank()) return
+            if (!enableCustomSelectionPopup || selectionJson.isNullOrBlank()) return
             Log.d("FWV", "SelectionBridge.onSelection -> $selectionJson")
             Handler(Looper.getMainLooper()).post {
                 try {
@@ -88,7 +91,7 @@ class FloatingWebViewService : Service() {
                     val text = obj.optString("text", "")
 
                     if (text.isNotEmpty()) {
-                        showSelectionPopup(lastTouchedRootView, lastTouchedWebView, left, top, width, height, text)
+                        scheduleSelectionPopup(left, top, width, height, text)
                     }
                 } catch (e: Exception) {
                     Log.e("FWV", "onSelection parse error", e)
@@ -96,16 +99,6 @@ class FloatingWebViewService : Service() {
             }
         }
 
-        @JavascriptInterface
-        fun onTextSelected(text: String?) {
-            if (text.isNullOrBlank()) return
-            val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("Copied Text", text))
-            Handler(Looper.getMainLooper()).post {
-                Toast.makeText(applicationContext, "Copied: ${text.take(200)}", Toast.LENGTH_SHORT).show()
-            }
-            Log.d("FWV", "SelectionBridge.onTextSelected -> ${text.take(200)}")
-        }
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -180,7 +173,9 @@ class FloatingWebViewService : Service() {
             width,
             height,
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE,
-            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -239,8 +234,9 @@ class FloatingWebViewService : Service() {
             allowContentAccess = true
         }
 
-        // Add Javascript bridge
-        webView.addJavascriptInterface(SelectionBridge(), "AndroidSelection")
+        if (enableCustomSelectionPopup) {
+            webView.addJavascriptInterface(SelectionBridge(), "AndroidSelection")
+        }
 
         webView.isFocusable = true
         webView.isFocusableInTouchMode = true
@@ -294,24 +290,12 @@ class FloatingWebViewService : Service() {
                     }
 
                     // Dismiss any existing popup
-                    currentSelectionPopup?.dismiss()
+                    cancelSelectionPopup()
+                }
+                MotionEvent.ACTION_MOVE -> {
+                    cancelSelectionPopup()
                 }
             }
-            false
-        }
-
-        // Handle long clicks - IMPORTANT: return false to allow WebView selection
-        webView.setOnLongClickListener {
-            lastTouchedRootView = rootView
-            lastTouchedWebView = webView
-
-            if ((params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) != 0) {
-                params.flags = params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
-                try { windowManager.updateViewLayout(rootView, params) } catch (_: Exception) {}
-            }
-            webView.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
-
-            // Return false to allow WebView's native selection to work
             false
         }
 
@@ -351,6 +335,8 @@ class FloatingWebViewService : Service() {
                 val faviconUrl = "https://www.google.com/s2/favicons?domain=${Uri.parse(actualUrl).host}&sz=64"
                 saveVisitedPage(actualUrl, title, faviconUrl)
 
+                if (!enableCustomSelectionPopup) return
+
                 // Inject selection detection script
                 val js = """
 (function() {
@@ -361,17 +347,62 @@ class FloatingWebViewService : Service() {
   
   var lastSelection = '';
   var selectionTimeout = null;
+  var longPressTimer = null;
+  var touchStartX = 0;
+  var touchStartY = 0;
+  var longPressTriggered = false;
+  var MOVE_THRESHOLD = 12;
+  var LONG_PRESS_MS = 450;
+  var HANDLE_SIZE = 22;
+  var currentRange = null;
+  var startHandle = null;
+  var endHandle = null;
+  var activeHandle = null;
+  var isDraggingHandle = false;
   
-  function getSelectionInfo() {
+  function cloneRange(range) {
+    return range ? range.cloneRange() : null;
+  }
+
+  function getEffectiveRange() {
     try {
       var sel = window.getSelection();
-      if (!sel || sel.rangeCount === 0) return null;
-      var text = sel.toString().trim();
+      if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+        currentRange = cloneRange(sel.getRangeAt(0));
+        return cloneRange(currentRange);
+      }
+      if (currentRange && !currentRange.collapsed) {
+        return cloneRange(currentRange);
+      }
+    } catch (e) {
+      try { AndroidSelection.onDebug('getEffectiveRange error: ' + e.message); } catch(_) {}
+    }
+    return null;
+  }
+
+  function applyRange(range) {
+    if (!range) return false;
+    try {
+      var sel = window.getSelection();
+      if (!sel) return false;
+      sel.removeAllRanges();
+      sel.addRange(range);
+      currentRange = cloneRange(range);
+      return true;
+    } catch (e) {
+      try { AndroidSelection.onDebug('applyRange error: ' + e.message); } catch(_) {}
+      return false;
+    }
+  }
+
+  function getSelectionInfo() {
+    try {
+      var range = getEffectiveRange();
+      if (!range) return null;
+      var text = range.toString().trim();
       if (!text || text.length === 0) return null;
       
-      var range = sel.getRangeAt(0);
       var rect = range.getBoundingClientRect();
-      
       return {
         left: rect.left + window.pageXOffset,
         top: rect.top + window.pageYOffset,
@@ -384,19 +415,287 @@ class FloatingWebViewService : Service() {
       return null; 
     }
   }
+
+  function comparePoints(nodeA, offsetA, nodeB, offsetB) {
+    var a = document.createRange();
+    a.setStart(nodeA, offsetA);
+    a.collapse(true);
+    var b = document.createRange();
+    b.setStart(nodeB, offsetB);
+    b.collapse(true);
+    return a.compareBoundaryPoints(Range.START_TO_START, b);
+  }
+
+  function createNormalizedRange(startNode, startOffset, endNode, endOffset) {
+    if (!startNode || !endNode) return null;
+    var cmp = comparePoints(startNode, startOffset, endNode, endOffset);
+    var range = document.createRange();
+    if (cmp <= 0) {
+      range.setStart(startNode, startOffset);
+      range.setEnd(endNode, endOffset);
+    } else {
+      range.setStart(endNode, endOffset);
+      range.setEnd(startNode, startOffset);
+    }
+    return range;
+  }
+
+  function ensureHandles() {
+    function wireHandle(handle, kind) {
+      handle.dataset.kind = kind;
+      handle.addEventListener('touchstart', beginHandleDrag, {passive: false});
+      handle.addEventListener('touchmove', moveHandleDrag, {passive: false});
+      handle.addEventListener('touchend', endHandleDrag, {passive: false});
+      handle.addEventListener('touchcancel', endHandleDrag, {passive: false});
+      handle.addEventListener('mousedown', beginHandleDrag, false);
+    }
+
+    if (!startHandle) {
+      startHandle = document.createElement('div');
+      startHandle.id = '_fwv_start_handle';
+      startHandle.style.cssText = 'position:absolute;width:22px;height:22px;border-radius:11px;background:#1A73E8;border:3px solid #FFFFFF;box-shadow:0 1px 5px rgba(0,0,0,.35);z-index:2147483647;pointer-events:auto;touch-action:none;display:none;';
+      wireHandle(startHandle, 'start');
+      document.documentElement.appendChild(startHandle);
+    }
+    if (!endHandle) {
+      endHandle = document.createElement('div');
+      endHandle.id = '_fwv_end_handle';
+      endHandle.style.cssText = 'position:absolute;width:22px;height:22px;border-radius:11px;background:#1A73E8;border:3px solid #FFFFFF;box-shadow:0 1px 5px rgba(0,0,0,.35);z-index:2147483647;pointer-events:auto;touch-action:none;display:none;';
+      wireHandle(endHandle, 'end');
+      document.documentElement.appendChild(endHandle);
+    }
+  }
+
+  function hideHandles() {
+    if (startHandle) startHandle.style.display = 'none';
+    if (endHandle) endHandle.style.display = 'none';
+  }
+
+  function updateHandles() {
+    try {
+      var range = getEffectiveRange();
+      if (!range || range.collapsed) {
+        hideHandles();
+        return;
+      }
+
+      ensureHandles();
+      var startRange = document.createRange();
+      startRange.setStart(range.startContainer, range.startOffset);
+      startRange.setEnd(range.startContainer, range.startOffset);
+      var endRange = document.createRange();
+      endRange.setStart(range.endContainer, range.endOffset);
+      endRange.setEnd(range.endContainer, range.endOffset);
+
+      var startRect = startRange.getBoundingClientRect();
+      var endRect = endRange.getBoundingClientRect();
+      var mainRect = range.getBoundingClientRect();
+
+      var startX = ((startRect && (startRect.left || startRect.right)) ? startRect.left : mainRect.left) + window.pageXOffset - HANDLE_SIZE / 2;
+      var startY = ((startRect && (startRect.bottom || startRect.top)) ? startRect.bottom : mainRect.bottom) + window.pageYOffset - HANDLE_SIZE / 2;
+      var endX = ((endRect && (endRect.right || endRect.left)) ? endRect.right : mainRect.right) + window.pageXOffset - HANDLE_SIZE / 2;
+      var endY = ((endRect && (endRect.bottom || endRect.top)) ? endRect.bottom : mainRect.bottom) + window.pageYOffset - HANDLE_SIZE / 2;
+
+      startHandle.style.left = startX + 'px';
+      startHandle.style.top = startY + 'px';
+      startHandle.style.display = 'block';
+
+      endHandle.style.left = endX + 'px';
+      endHandle.style.top = endY + 'px';
+      endHandle.style.display = 'block';
+    } catch (e) {
+      try { AndroidSelection.onDebug('updateHandles error: ' + e.message); } catch(_) {}
+      hideHandles();
+    }
+  }
+
+  function getCaretRange(x, y) {
+    if (document.caretRangeFromPoint) {
+      return document.caretRangeFromPoint(x, y);
+    }
+
+    if (document.caretPositionFromPoint) {
+      var pos = document.caretPositionFromPoint(x, y);
+      if (!pos) return null;
+      var range = document.createRange();
+      range.setStart(pos.offsetNode, pos.offset);
+      range.collapse(true);
+      return range;
+    }
+
+    return null;
+  }
+
+  function isWordChar(ch) {
+    return /[\p{L}\p{N}_]/u.test(ch);
+  }
+
+  function expandRangeToWord(range) {
+    if (!range) return null;
+
+    var node = range.startContainer;
+    if (!node) return null;
+
+    if (node.nodeType !== Node.TEXT_NODE) {
+      if (node.childNodes && node.childNodes.length > 0) {
+        var childIndex = Math.min(range.startOffset, node.childNodes.length - 1);
+        node = node.childNodes[childIndex];
+        if (node && node.nodeType !== Node.TEXT_NODE && node.firstChild && node.firstChild.nodeType === Node.TEXT_NODE) {
+          node = node.firstChild;
+        }
+      }
+      if (!node || node.nodeType !== Node.TEXT_NODE) return null;
+    }
+
+    var text = node.textContent || '';
+    if (!text.length) return null;
+
+    var index = Math.min(range.startOffset, text.length - 1);
+    if (index < 0) return null;
+
+    if (!isWordChar(text.charAt(index)) && index > 0 && isWordChar(text.charAt(index - 1))) {
+      index -= 1;
+    }
+
+    if (!isWordChar(text.charAt(index))) return null;
+
+    var start = index;
+    var end = index + 1;
+
+    while (start > 0 && isWordChar(text.charAt(start - 1))) start--;
+    while (end < text.length && isWordChar(text.charAt(end))) end++;
+
+    var wordRange = document.createRange();
+    wordRange.setStart(node, start);
+    wordRange.setEnd(node, end);
+    return wordRange;
+  }
+
+  function selectWordAtPoint(x, y) {
+    try {
+      var caret = getCaretRange(x, y);
+      var wordRange = expandRangeToWord(caret);
+      if (!wordRange) return false;
+      applyRange(wordRange);
+      updateHandles();
+      notifySelection(true);
+      return true;
+    } catch (e) {
+      try { AndroidSelection.onDebug('selectWordAtPoint error: ' + e.message); } catch(_) {}
+      return false;
+    }
+  }
   
-  function notifySelection() {
+  function updateRangeFromPoint(clientX, clientY, kind) {
+    var caret = getCaretRange(clientX, clientY);
+    if (!caret || !currentRange) return false;
+
+    var nextRange = null;
+    if (kind === 'start') {
+      nextRange = createNormalizedRange(
+        caret.startContainer,
+        caret.startOffset,
+        currentRange.endContainer,
+        currentRange.endOffset
+      );
+    } else {
+      nextRange = createNormalizedRange(
+        currentRange.startContainer,
+        currentRange.startOffset,
+        caret.startContainer,
+        caret.startOffset
+      );
+    }
+
+    if (!nextRange || nextRange.collapsed) return false;
+    applyRange(nextRange);
+    updateHandles();
+    return true;
+  }
+
+  function getPointFromEvent(e) {
+    if (e.touches && e.touches.length) {
+      return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+    if (e.changedTouches && e.changedTouches.length) {
+      return { x: e.changedTouches[0].clientX, y: e.changedTouches[0].clientY };
+    }
+    return { x: e.clientX, y: e.clientY };
+  }
+
+  function beginHandleDrag(e) {
+    if (!currentRange) return;
+    if (longPressTimer) clearTimeout(longPressTimer);
+    longPressTimer = null;
+    activeHandle = e.currentTarget && e.currentTarget.dataset ? e.currentTarget.dataset.kind : null;
+    isDraggingHandle = true;
+    e.preventDefault();
+    e.stopPropagation();
+    applyRange(currentRange);
+  }
+
+  function moveHandleDrag(e) {
+    if (!isDraggingHandle || !activeHandle) return;
+    var point = getPointFromEvent(e);
+    if (updateRangeFromPoint(point.x, point.y, activeHandle)) {
+      notifySelection(false);
+    }
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  function endHandleDrag(e) {
+    if (!isDraggingHandle) return;
+    var point = getPointFromEvent(e);
+    if (activeHandle) {
+      updateRangeFromPoint(point.x, point.y, activeHandle);
+    }
+    isDraggingHandle = false;
+    activeHandle = null;
+    applyRange(currentRange);
+    updateHandles();
+    notifySelection(true);
+    e.preventDefault();
+    e.stopPropagation();
+  }
+
+  document.addEventListener('mousemove', function(e) {
+    if (!isDraggingHandle || !activeHandle) return;
+    if (updateRangeFromPoint(e.clientX, e.clientY, activeHandle)) {
+      notifySelection(false);
+    }
+    e.preventDefault();
+  }, true);
+
+  document.addEventListener('mouseup', function(e) {
+    if (!isDraggingHandle) return;
+    endHandleDrag(e);
+  }, true);
+
+  function notifySelection(shouldNotifyAndroid) {
+    if (shouldNotifyAndroid === undefined) shouldNotifyAndroid = true;
     var info = getSelectionInfo();
     if (info && info.text !== lastSelection) {
       lastSelection = info.text;
-      try {
+      updateHandles();
+      if (shouldNotifyAndroid) try {
         AndroidSelection.onSelection(JSON.stringify(info));
         AndroidSelection.onDebug('selection-sent len=' + info.text.length);
       } catch(e) {
         AndroidSelection.onDebug('notify error: ' + e.message);
       }
+    } else if (info) {
+      updateHandles();
+      if (shouldNotifyAndroid) try {
+        AndroidSelection.onSelection(JSON.stringify(info));
+      } catch (e) {}
+    } else if (!info && currentRange && !currentRange.collapsed) {
+      applyRange(currentRange);
+      updateHandles();
     } else if (!info) {
       lastSelection = '';
+      currentRange = null;
+      hideHandles();
     }
   }
   
@@ -407,14 +706,57 @@ class FloatingWebViewService : Service() {
       notifySelection();
     }, 300);
   }, {passive: true});
-  
-  // Also check on touchend/mouseup
+
+  document.addEventListener('touchstart', function(e) {
+    if (e.target === startHandle || e.target === endHandle || isDraggingHandle) return;
+    if (!e.touches || e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    touchStartX = touch.clientX;
+    touchStartY = touch.clientY;
+    longPressTriggered = false;
+    if (longPressTimer) clearTimeout(longPressTimer);
+    longPressTimer = setTimeout(function() {
+      longPressTriggered = selectWordAtPoint(touchStartX, touchStartY);
+    }, LONG_PRESS_MS);
+  }, {passive: true});
+
+  document.addEventListener('touchmove', function(e) {
+    if (isDraggingHandle) return;
+    if (!e.touches || e.touches.length !== 1) return;
+    var touch = e.touches[0];
+    if (Math.abs(touch.clientX - touchStartX) > MOVE_THRESHOLD || Math.abs(touch.clientY - touchStartY) > MOVE_THRESHOLD) {
+      if (longPressTimer) clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+  }, {passive: true});
+
   document.addEventListener('touchend', function() {
-    setTimeout(notifySelection, 350);
+    if (isDraggingHandle) return;
+    if (longPressTimer) clearTimeout(longPressTimer);
+    longPressTimer = null;
+    if (longPressTriggered) {
+      setTimeout(function(){ notifySelection(true); }, 50);
+    } else {
+      setTimeout(function(){ notifySelection(true); }, 350);
+    }
+  }, {passive: true});
+
+  document.addEventListener('touchcancel', function() {
+    if (longPressTimer) clearTimeout(longPressTimer);
+    longPressTimer = null;
   }, {passive: true});
   
+  // Also check on touchend/mouseup
   document.addEventListener('mouseup', function() {
-    setTimeout(notifySelection, 350);
+    if (isDraggingHandle) return;
+    setTimeout(function(){ notifySelection(true); }, 350);
+  }, {passive: true});
+
+  window.addEventListener('scroll', function() {
+    setTimeout(function() {
+      applyRange(currentRange);
+      updateHandles();
+    }, 0);
   }, {passive: true});
   
   try { AndroidSelection.onDebug('injection-done'); } catch(e){}
@@ -436,6 +778,39 @@ class FloatingWebViewService : Service() {
         webView.loadUrl(url)
     }
 
+    private fun scheduleSelectionPopup(
+        rectLeft: Float,
+        rectTop: Float,
+        rectWidth: Float,
+        rectHeight: Float,
+        selectedText: String
+    ) {
+        cancelSelectionPopup(dismissCurrent = false)
+
+        val popupTask = Runnable {
+            showSelectionPopup(
+                lastTouchedRootView,
+                lastTouchedWebView,
+                rectLeft,
+                rectTop,
+                rectWidth,
+                rectHeight,
+                selectedText
+            )
+        }
+
+        pendingSelectionPopup = popupTask
+        mainHandler.postDelayed(popupTask, 250)
+    }
+
+    private fun cancelSelectionPopup(dismissCurrent: Boolean = true) {
+        pendingSelectionPopup?.let(mainHandler::removeCallbacks)
+        pendingSelectionPopup = null
+        if (dismissCurrent) {
+            currentSelectionPopup?.dismiss()
+        }
+    }
+
     private fun showSelectionPopup(
         anchorRoot: View?,
         webView: WebView?,
@@ -454,6 +829,7 @@ class FloatingWebViewService : Service() {
 
         // Dismiss any existing popup
         currentSelectionPopup?.dismiss()
+        pendingSelectionPopup = null
 
         val inflater = LayoutInflater.from(this)
         val popupView = inflater.inflate(R.layout.selection_popup, null)
@@ -625,6 +1001,23 @@ class FloatingWebViewService : Service() {
                     R.id.go_forward -> { if (webView.canGoForward()) webView.goForward(); true }
                     R.id.reload -> { webView.reload(); true }
                     R.id.new_tab -> { showFloatingWebView(webView.url ?: "https://www.google.com", "medium"); true }
+                    R.id.copy_selected_text -> {
+                        webView.evaluateJavascript("(function(){var s=window.getSelection();return s?s.toString():'';})()") { selected ->
+                            val text = try {
+                                JSONObject("{\"v\":$selected}").getString("v")
+                            } catch (e: Exception) {
+                                selected?.trim('"') ?: ""
+                            }
+                            if (text.isNotBlank()) {
+                                val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                                clipboard.setPrimaryClip(ClipData.newPlainText("Copied Text", text))
+                                Toast.makeText(this, "Selected text copied", Toast.LENGTH_SHORT).show()
+                            } else {
+                                Toast.makeText(this, "No selected text", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                        true
+                    }
                     R.id.copy_all -> {
                         webView.evaluateJavascript("(function(){return document.body.innerText;})()") { allText ->
                             val text = allText?.trim('\'') ?: ""
@@ -767,6 +1160,7 @@ class FloatingWebViewService : Service() {
     private fun removeWindow(windowId: Int) {
         try {
             currentSelectionPopup?.dismiss()
+            cancelSelectionPopup(dismissCurrent = false)
             activeWindows[windowId]?.let { (view, _) ->
                 windowManager.removeView(view)
                 (view.findViewById<WebView>(R.id.webView))?.destroy()
@@ -779,7 +1173,7 @@ class FloatingWebViewService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        currentSelectionPopup?.dismiss()
+        cancelSelectionPopup()
         CookieManager.getInstance().flush()
         activeWindows.keys.toList().forEach { removeWindow(it) }
     }

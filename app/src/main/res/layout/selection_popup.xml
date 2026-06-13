@@ -15,7 +15,7 @@
         android:text="Copy"
         android:textColor="#FFFFFF"
         android:padding="8dp"
-        android:background="?attr/selectableItemBackgroundBorderless"/>
+        android:background="@drawable/selection_popup_button" />
 
     <TextView
         android:id="@+id/sel_select_all"
@@ -25,5 +25,5 @@
         android:textColor="#FFFFFF"
         android:padding="8dp"
         android:layout_marginStart="8dp"
-        android:background="?attr/selectableItemBackgroundBorderless"/>
+        android:background="@drawable/selection_popup_button" />
 </LinearLayout>
